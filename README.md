@@ -19,7 +19,8 @@ The inpaint module credts to (https://github.com/cheind/inpaint)
 ![Contour](/demo/demo2.JPG?raw=true)
 
 3. Click the "add to foreground" to run the inpaint function. NOTE: THIS MAY TAKE SEVERAL MINUTES!
-| Object1        | Object2     |
+
+| Object1         | Object2       |
 | :-------------: |:-------------:|
 | ![Lion](/demo/demo3.JPG?raw=true) | ![Human](/demo/demo4.JPG?raw=true) |
 
