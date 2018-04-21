@@ -3,6 +3,12 @@
 #include <iostream>
 #include <cmath>
 
+#include <vector>
+#include <map>
+#include <opencv2/opencv.hpp>
+
+#include "inc/inpaint/criminisi_inpainter.h"
+
 using namespace std;
 
 //////////////////////////////////////////////////////////
@@ -41,6 +47,13 @@ struct color3D // 色の構造体
 	float b; // 青
 };
 
+struct ImageInfo {
+	cv::Mat originalImage;
+	cv::Mat targetMask;
+    cv::Mat sourceMask;
+    cv::Mat background;
+};
+
 /* 数学関係の定数 */
 const float PI = 3.141592853f;
 
@@ -53,28 +66,45 @@ FName_t bmpfilename[maxnumberoffiles]; // ファイル名の配列（最大100�
 									   /* bmpファイルハンドリング関係の変数 */
 GLuint texture; // 元画像のデータへのポインタ
 							  /* 3次元背景のモデリング関係の変数 */
-struct vector2D ctrlPoint[5]; // 制御点のスクリーン座標
+vector2D ctrlPoint[5]; // 制御点のスクリーン座標
 int selectedCtrlPointIndex = -1; // 選択された制御点のインデックス
 float gradient[4]; // スパイダリーメッシュの傾き
 struct vector5D estimatedVertex[13]; // 推定された頂点の座標
+
 struct vector3D eye; // 視点のワールド座標
 int resolutionnumber = 0; // 現在選択されている解像度の番号
+int modenumber = 0;
+bool on_press = false; //whether drawing the fg contour
 float rough_coefficient = 0.05f; // 画像解析の細かさ（preview: 0.05f, lowresolution: 0.01f, normal:0.005, highresolution: 0.001f）
 int deduceFlag = 0; // 現在の処理を示す旗
-
+bool test_flag = false;
 					/* 透視投影関係の変数 */
 float theta = 0.0f; // 方位角
 float phi = 0.0f; // 仰角
 float R, R0; // 視点と注視点の距離
 float mat[9]; // 変換行列
 float pbeginsx, pbeginsy; // マウスドラッグの始点
-struct vector2D transferedEstimatedVertex[13]; // 透視変換後の推定された頂点のスクリーン座標
+vector2D transferedEstimatedVertex[13]; // 透視変換後の推定された頂点のスクリーン座標
 float oevminx, oevmaxx, oevminy, oevmaxy, oevdiffx, oevdiffy; // 透視変換の整合性のための変数
 float tevminx, tevmaxx, tevminy, tevmaxy, tevdiffx, tevdiffy; // 透視変換の整合性のための変数
 float tevminx0, tevmaxx0, tevminy0, tevmaxy0, tevdiffx0, tevdiffy0; // 透視変換の整合性のための変数
 
+vector<vector<vector<vector5D>>> foreground_objects;
+vector<vector<vector<vector2D>>> transfered_foreground_objects;
+//vector<vector<vector5D>> foreground_objects;
+//vector<map<int, vector<int>>> foreground_objects;
+vector<vector5D> current_selection;
+
+map<int, vector<int>, greater<int>> current_contour;
+
+ImageInfo ii;
+
+
+int last_x,last_y;
+int start_x, start_y;
+
 /* OpenGL関係の変数 */
-unsigned char * global_data;
+//unsigned char * global_data;
 int global_width, global_height;
 int main_window;
 GLUI *glui;
@@ -84,26 +114,22 @@ int   segments = 8;
 
 GLuint loadTexture(const char * filename)
 {
-  GLuint texture = 0;
+	GLuint texture = 0;
 
-  unsigned char header[54];
+	cv::Mat tmp = cv::imread(filename);
+	cv::Mat inputImage;
+	cv::flip(tmp, inputImage, 0);
 
-  FILE * file = fopen(filename, "rb");
-  
-  if ( fread(header, 1, 54, file)!=54 || header[0]!='B' || header[1]!='M'){ // If not 54 bytes read : problem
-    printf("Not a correct BMP file\n");
-    return false;
-  }
-  
+	ii.originalImage = inputImage.clone();
+	ii.background = ii.originalImage.clone();
 
-	if (file == NULL) return 0;
-  //imageSize = *(int*)&(header[0x22]);
-  global_width = *(int*)&(header[0x12]);
-  global_height = *(int*)&(header[0x16]);
-	global_data = (unsigned char *)malloc(global_width * global_height * 3);
+	ii.targetMask.create(ii.originalImage.size(), CV_8UC1);
+	ii.targetMask.setTo(0);
+    ii.sourceMask.create(ii.originalImage.size(), CV_8UC1);
+	ii.sourceMask.setTo(0);
 
-	fread(global_data, 1,  global_width * global_height * 3, file);
-	fclose(file);
+	global_width = ii.originalImage.cols;
+	global_height = ii.originalImage.rows;
 
 	return texture;
 }
@@ -115,18 +141,14 @@ void getEstimatedVerticesScreenCoordinates(void)
 
 	for (i = 0; i<4; i++){
 		gradient[i] = (ctrlPoint[i + 1].sy - ctrlPoint[0].sy) / (ctrlPoint[i + 1].sx - ctrlPoint[0].sx);
-  }
+	}
 	// 消失点（0）
 	estimatedVertex[0].sx = ctrlPoint[0].sx;
-  //cout << estimatedVertex[0].sx << endl;
 	estimatedVertex[0].sy = ctrlPoint[0].sy;
-  //cout << estimatedVertex[0].sy << endl;
 	// インナーレクタングルの頂点（1, 2, 8, 7）
 	// 左下（1）
 	estimatedVertex[1].sx = ctrlPoint[1].sx;
-  //cout << estimatedVertex[1].sx << endl;
 	estimatedVertex[1].sy = ctrlPoint[1].sy;
-  //cout << estimatedVertex[1].sy << endl;
 	// 右下（2）
 	estimatedVertex[2].sx = ctrlPoint[2].sx;
 	estimatedVertex[2].sy = ctrlPoint[2].sy;
@@ -159,9 +181,9 @@ void getEstimatedVerticesScreenCoordinates(void)
 }
 
 // 推定された頂点のワールド座標の取得
-void getEstimatedVerticesWorldCoordinates(void)
+void getEstimatedVerticesWorldCoordinates()
 {
-	int i;
+	
 	float grad; // 傾き
 	float height; // 直方体の高さ
 
@@ -170,7 +192,7 @@ void getEstimatedVerticesWorldCoordinates(void)
 	eye.x = ctrlPoint[0].sx; eye.y = ctrlPoint[0].sy; eye.z = 0.0f;
 	//printf("eye: %12f %12f %12f\n",eye.x,eye.y,eye.z);
 	// floor上（y=0.0f）の推定された頂点（1, 2, 3, 4, 5, 6）のワールド座標の取得
-	for (i = 1; i <= 6; i++)
+	for (int i = 1; i <= 6; i++)
 	{
 		grad = -(1.0+eye.y) / (estimatedVertex[i].sy - eye.y);
     
@@ -194,7 +216,7 @@ void getEstimatedVerticesWorldCoordinates(void)
 	estimatedVertex[7].y = estimatedVertex[8].y = height -1.0;
 	estimatedVertex[7].z = estimatedVertex[1].z; estimatedVertex[8].z = estimatedVertex[2].z;
 	// ceiling上の推定された頂点（9, 10, 11, 12）のワールド座標の取得
-	for (i = 9; i <= 12; i++)
+	for (int i = 9; i <= 12; i++)
 	{
 		grad = (height - eye.y - 1.0) / (estimatedVertex[i].sy - eye.y);
 		estimatedVertex[i].x = grad * (estimatedVertex[i].sx - eye.x) + eye.x;
@@ -202,9 +224,31 @@ void getEstimatedVerticesWorldCoordinates(void)
 		estimatedVertex[i].y = height - 1.0;
 	}
 	
+	//for foreground objs
+	for(int i = 0; i < (int)foreground_objects.size(); i++){
+		//vector<vector<vector5D>>::iterator iter = foreground_objects[i].begin();
+		float ground = foreground_objects[i][0][0].sy;
+		
+		grad = -(1.0+eye.y) / (ground - eye.y);
+		float z = grad * (-1.0f - eye.z) + eye.z;
+		
+		for(int j = 0; j < (int)foreground_objects[i].size(); j++){
+			for(int k = 0; k < (int)foreground_objects[i][j].size(); k++){
+			
+				height = (foreground_objects[i][j][k].sy - ground) / (-1.0)*z;
+				grad = (height - eye.y - 1.0) / (foreground_objects[i][j][k].sy - eye.y);
+				foreground_objects[i][j][k].x = grad * (foreground_objects[i][j][k].sx - eye.x) + eye.x;
+				foreground_objects[i][j][k].z = grad * (-1.0f - eye.z) + eye.z;
+				foreground_objects[i][j][k].y = height - 1.0;
+			}
+			
+		}
+		
+	}
+	
 	// 透視変換の整合性のための変数の取得
 	oevminx = 0.0f, oevmaxx = 0.0f, oevminy = 0.0f, oevmaxy = 0.0f; //oevdiffx, oevdiffy;
-	for(i=1;i<=12;i++)
+	for(int i=1;i<=12;i++)
 	{
 		if(estimatedVertex[i].sx<oevminx) oevminx=estimatedVertex[i].sx;
 		else if(estimatedVertex[i].sx>oevmaxx) oevmaxx=estimatedVertex[i].sx;
@@ -213,6 +257,8 @@ void getEstimatedVerticesWorldCoordinates(void)
 	}
 	oevdiffx = oevmaxx - oevminx; oevdiffy = oevmaxy - oevminy;
 }
+
+
 
 // 視点と透視変換行列の取得
 void getPerspectiveTransferMatrix(void)
@@ -251,9 +297,28 @@ void getTransferedEstimatedVerticesScreenCoordinates(void)
 		transferedEstimatedVertex[i].sy = R * inte.y / (R - inte.z);
 	}
 
-  transferedEstimatedVertex[8].sy = 1.0;
-  transferedEstimatedVertex[7].sy = 1.0;
-
+	transferedEstimatedVertex[8].sy = 1.0;
+	transferedEstimatedVertex[7].sy = 1.0;
+	
+	
+	for(int i = 0; i < (int)foreground_objects.size(); i++){		
+		for(int j = 0; j < (int)foreground_objects[i].size(); j++){
+			for(int k = 0; k < (int)foreground_objects[i][j].size(); k++){
+				diff.x = foreground_objects[i][j][k].x - estimatedVertex[0].x;
+				diff.y = foreground_objects[i][j][k].y - estimatedVertex[0].y;
+				diff.z = foreground_objects[i][j][k].z - estimatedVertex[0].z;
+				inte.x = diff.x*mat[0] + diff.y*mat[3] + diff.z*mat[6];
+				inte.y = diff.x*mat[1] + diff.y*mat[4] + diff.z*mat[7];
+				inte.z = diff.x*mat[2] + diff.y*mat[5] + diff.z*mat[8];
+				transfered_foreground_objects[i][j][k].sx = R * inte.x / (R - inte.z);
+				transfered_foreground_objects[i][j][k].sy = R * inte.y / (R - inte.z);
+				
+			}
+			
+		}
+		
+	}
+	
 	// 透視変換の整合性のための変数の取得
 	tevminx = 1.0f, tevmaxx = -1.0f, tevminy = 1.0f, tevmaxy = -1.0f; //tevdiffx, tevdiffy;
 	for (i = 1; i <= 12; i++)
@@ -284,6 +349,17 @@ void getTransferedEstimatedVerticesScreenCoordinates(void)
 		transferedEstimatedVertex[i].sy = (transferedEstimatedVertex[i].sy - tevminy) / tevdiffy;
 		transferedEstimatedVertex[i].sx *= oevdiffx; transferedEstimatedVertex[i].sy *= oevdiffy;
 		transferedEstimatedVertex[i].sx += oevminx; transferedEstimatedVertex[i].sy += oevminy;
+	}
+	
+	for(int i = 0; i < (int)foreground_objects.size(); i++){		
+		for(int j = 0; j < (int)foreground_objects[i].size(); j++){
+			for(int k = 0; k < (int)foreground_objects[i][j].size(); k++){
+				transfered_foreground_objects[i][j][k].sx = (transfered_foreground_objects[i][j][k].sx - tevminx) / tevdiffx;
+				transfered_foreground_objects[i][j][k].sy = (transfered_foreground_objects[i][j][k].sy - tevminy) / tevdiffy;
+				transfered_foreground_objects[i][j][k].sx *= oevdiffx; transfered_foreground_objects[i][j][k].sy *= oevdiffy;
+				transfered_foreground_objects[i][j][k].sx += oevminx; transfered_foreground_objects[i][j][k].sy += oevminy;
+			}
+		}
 	}
 
 }
@@ -339,9 +415,8 @@ vector2D getInitialScreenCoordinates(struct vector3D input)
 }
 
 // スパイダリーメッシュの描画
-void drawSpideryMesh(void)
+void drawSpideryMesh()
 {
-  
 	glColor3f(0.0f, 0.2f, 1.0f);
 	glLineWidth(3.0f);
 	glBegin(GL_LINE_LOOP);
@@ -491,6 +566,7 @@ void draw3Dbackground(void)
 		glVertex2f(bpoint.sx, bpoint.sy);
 		glVertex2f(epoint.sx, epoint.sy);
 	}
+	glEnd();
 	// left wall縦線（z: 1～5）
 	begin.x = end.x = estimatedVertex[1].x;
 	begin.y = estimatedVertex[1].y; end.y = estimatedVertex[7].y;
@@ -547,11 +623,11 @@ void draw3Dbackground(void)
 }
 
 // 元画像の引数のスクリーン座標の色を返す関数
-color3D screenCoordinates2sourceImageColor(struct vector2D input)
+color3D screenCoordinates2sourceImageColor(vector2D input, bool is_bg)
 {
-	struct color3D output;
+	color3D output;
 	int x, y; // 画像スケールでのx, y座標
-	int headindex; // x, y座標のピクセルの色情報の先頭（赤）のインデックス
+	//int headindex; // x, y座標のピクセルの色情報の先頭（赤）のインデックス
 
 	if (input.sx<-1.0f) output.r = output.g = output.b = 1.0f;
 	else if (input.sx>1.0f) output.r = output.g = output.b = 1.0f;
@@ -563,11 +639,16 @@ color3D screenCoordinates2sourceImageColor(struct vector2D input)
     
 		x = (int)((input.sx+1)*global_width/2.0); y = (int)((input.sy+1)*global_height/2.0);
 		// x, y座標のピクセルの色情報の先頭（赤）のインデックスの取得
-		headindex = y * 3 * global_width + x * 3;
 		// 色の取
-		output.r = global_data[headindex+2] / 255.0f;
-		output.g = global_data[headindex+1] / 255.0f;
-		output.b = global_data[headindex] / 255.0f;
+
+		cv::Vec3b intensity;
+		if(is_bg)
+			intensity = ii.background.at<cv::Vec3b>(y, x);
+		else
+			intensity = ii.originalImage.at<cv::Vec3b>(y, x);
+		output.b = intensity.val[0] / 255.0;
+		output.g = intensity.val[1] / 255.0;
+		output.r = intensity.val[2] / 255.0;
 		
 	}
 
@@ -575,7 +656,7 @@ color3D screenCoordinates2sourceImageColor(struct vector2D input)
 }
 
 // 生成画像の描画
-void drawGeneratedImage(void)
+void drawGeneratedImage()
 {
 	int i;
 	float k,l;
@@ -611,7 +692,7 @@ void drawGeneratedImage(void)
 			// メッシュの重心の変形前のスクリーン座標の取得
 			screenGravityPoint=getInitialScreenCoordinates(worldGravityPoint);
 			// メッシュの重心の変形前のスクリーン座標における元画像の色の取得
-			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint);
+			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint, true);
 			glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
 			// メッシュを重心の変形前のスクリーン座標における元画像の色で塗りつぶし
 			for(i=0;i<4;i++)glVertex2f(screenVertex[i].sx,screenVertex[i].sy);
@@ -637,7 +718,7 @@ void drawGeneratedImage(void)
 			// メッシュの重心の変形前のスクリーン座標の取得
 			screenGravityPoint=getInitialScreenCoordinates(worldGravityPoint);
 			// メッシュの重心の変形前のスクリーン座標における元画像の色の取得
-			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint);
+			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint, true);
       glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
 			// メッシュを重心の変形前のスクリーン座標における元画像の色で塗りつぶし
 			for(i=0;i<4;i++)glVertex2f(screenVertex[i].sx,screenVertex[i].sy);
@@ -663,7 +744,7 @@ void drawGeneratedImage(void)
 			// メッシュの重心の変形前のスクリーン座標の取得
 			screenGravityPoint=getInitialScreenCoordinates(worldGravityPoint);
 			// メッシュの重心の変形前のスクリーン座標における元画像の色の取得
-			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint);
+			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint, true);
       glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
 			// メッシュを重心の変形前のスクリーン座標における元画像の色で塗りつぶし
 			for(i=0;i<4;i++)glVertex2f(screenVertex[i].sx,screenVertex[i].sy);
@@ -689,7 +770,7 @@ void drawGeneratedImage(void)
 			// メッシュの重心の変形前のスクリーン座標の取得
 			screenGravityPoint=getInitialScreenCoordinates(worldGravityPoint);
 			// メッシュの重心の変形前のスクリーン座標における元画像の色の取得
-			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint);
+			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint, true);
       glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
 			// メッシュを重心の変形前のスクリーン座標における元画像の色で塗りつぶし
 			for(i=0;i<4;i++)glVertex2f(screenVertex[i].sx,screenVertex[i].sy);
@@ -715,56 +796,155 @@ void drawGeneratedImage(void)
 			// メッシュの重心の変形前のスクリーン座標の取得
 			screenGravityPoint=getInitialScreenCoordinates(worldGravityPoint);
 			// メッシュの重心の変形前のスクリーン座標における元画像の色の取得
-			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint);
-      glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
+			colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint, true);
+			glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
 			// メッシュを重心の変形前のスクリーン座標における元画像の色で塗りつぶし
 			for(i=0;i<4;i++)glVertex2f(screenVertex[i].sx,screenVertex[i].sy);
 		}
 	}
+	
+	/////////foreground obj
+	
+	for(int m = 0; m < (int)foreground_objects.size(); m++){
+	
+		worldVertex[0].z=worldVertex[1].z=worldVertex[2].z=worldVertex[3].z=foreground_objects[m][0][0].z;
+		for(int n = 0; n < (int)foreground_objects[m].size() - 1; n++){
+			for(k=foreground_objects[m][n][0].y;k<foreground_objects[m][n+1][0].y;k+=rough_coefficient)
+			{
+				worldVertex[0].y=worldVertex[1].y=k;
+				worldVertex[2].y=worldVertex[3].y=k+rough_coefficient;
+				for(int q = 0; q < (int)foreground_objects[m][n].size(); q += 2){
+					for(l=foreground_objects[m][n][q].x;l<foreground_objects[m][n][q+1].x;l+=rough_coefficient)
+					{
+						worldVertex[0].x=worldVertex[3].x=l;
+						worldVertex[1].x=worldVertex[2].x=l+rough_coefficient;
+						// 共通処理
+						// メッシュの各頂点の変形後のスクリーン座標の取得
+						for(i=0;i<4;i++) screenVertex[i]=getScreenCoordinates(worldVertex[i]);
+						// メッシュの重心のワールド座標の取得
+						worldGravityPoint.x=(worldVertex[0].x+worldVertex[2].x)/2.0f;
+						worldGravityPoint.y=(worldVertex[0].y+worldVertex[2].y)/2.0f;
+						worldGravityPoint.z=(worldVertex[0].z+worldVertex[2].z)/2.0f;
+						// メッシュの重心の変形前のスクリーン座標の取得
+						screenGravityPoint=getInitialScreenCoordinates(worldGravityPoint);
+						// メッシュの重心の変形前のスクリーン座標における元画像の色の取得
+						colorGravityPoint=screenCoordinates2sourceImageColor(screenGravityPoint, false);
+						glColor3f(colorGravityPoint.r,colorGravityPoint.g,colorGravityPoint.b);
+						// メッシュを重心の変形前のスクリーン座標における元画像の色で塗りつぶし
+						for(i=0;i<4;i++)glVertex2f(screenVertex[i].sx,screenVertex[i].sy);
+					}
+				}
+			}
+		}
+	}
+	
+	
 	glEnd();
 	glDisable(GL_CULL_FACE);
   glColor3f(1.0,1.0,1.0);
 }
+/////////fore ground/////////////
 
-void myDisplay(void)
+void drawSelectedObj(){
+	
+	glColor3f(0.9,0.1,0.1);
+	glLineWidth(0.8);
+	
+	//for(int i = 0; i < foreground_objects.size(); i++){
+		glBegin(GL_LINES);
+		int j = 0;
+		int l = current_selection.size();
+		for(; j < l-1; j++){
+			glVertex2f(current_selection[j].sx, current_selection[j].sy);
+			glVertex2f(current_selection[j+1].sx, current_selection[j+1].sy);
+		}
+		if(on_press == false && l > 0){
+			glVertex2f(current_selection[j].sx, current_selection[j].sy);
+			glVertex2f(current_selection[0].sx, current_selection[0].sy);
+		}
+		glEnd();
+	//}
+	glColor3f(1.0,1.0,1.0);
+	
+}
+
+void drawTest(){
+	map<int,vector<int>, greater<int>>::iterator iter = current_contour.begin();
+	glColor3f(0.9,0.1,0.1);
+	glLineWidth(0.8);
+	float midx = global_width/2.0;
+	float midy = global_height/2.0;
+	glBegin(GL_LINES);
+	while(iter != current_contour.end()){
+				
+		if(current_contour[iter->first].size() > 1){
+			if((current_contour[iter->first].size() & 1) != 0){
+				cout << "ERROR" << endl;
+				//break;
+				iter++;
+				continue;
+			}
+			for(int i = 0; i < (int)current_contour[iter->first].size(); i += 2){
+						
+				glVertex2f(current_contour[iter->first][i]/midx - 1.0, 1.0 - (iter->first)/ midy);
+				glVertex2f(current_contour[iter->first][i+1]/ midx - 1.0, 1.0 - (iter->first)/ midy);
+									
+			}
+						
+		}
+					
+		iter++;
+	}
+	glEnd();
+	glColor3f(1.0,1.0,1.0);
+	test_flag = false;
+	
+}
+
+
+/////////////////////////////////
+
+void myDisplay()
 {
 	if (glutGetWindow() != main_window)glutSetWindow(main_window);
 	// バッファクリア
 	glClear(GL_COLOR_BUFFER_BIT);
 	// 元画像の描
-	if (deduceFlag == 0)
-	{
-    int w, h;
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-    
+
+	if (deduceFlag == 0){
 		glRasterPos2i(0, 0);
     
-    glBegin(GL_QUADS);
-      glTexCoord2f(0.0f, 0.0f); 
-      glVertex2i(-1.0, -1.0);
+		glBegin(GL_QUADS);
+		glTexCoord2f(0.0f, 0.0f); 
+		glVertex2i(-1, -1);
       
-      glTexCoord2f(1.0f, 0.0f); 
-      glVertex2i(1.0, -1.0);
+		glTexCoord2f(1.0f, 0.0f); 
+		glVertex2i(1, -1);
      
-      glTexCoord2f(1.0f, 1.0f); 
-      glVertex2i(1.0, 1.0);
+		glTexCoord2f(1.0f, 1.0f); 
+		glVertex2i(1, 1);
    
-      glTexCoord2f(0.0f, 1.0f); 
-      glVertex2i(-1.0, 1.0);
-    glEnd();
+		glTexCoord2f(0.0f, 1.0f); 
+		glVertex2i(-1, 1);
+		glEnd();
     
-  }
+    }
 	// スパイダリーメッシュの描画
-	if (deduceFlag == 0) drawSpideryMesh();
+	if (deduceFlag == 0 && modenumber == 0) drawSpideryMesh();
 	// 生成画像の描画
+	//cout << modenumber << endl;
+	if(deduceFlag == 0 && modenumber == 1) drawSelectedObj();
+	
 	if (deduceFlag) drawGeneratedImage();
 	//i 3次元背景の描画
 	if (deduceFlag && resolutionnumber == 0) draw3Dbackground();
 	// 画像の表示
 
+	if(test_flag) drawTest();
   glutSwapBuffers();
 }
+
+
 
 void myIdle(void)
 {
@@ -776,11 +956,7 @@ void myIdle(void)
 void myReshape(int x, int y)
 {
 	// ウィンドウサイズの変更
-	int w, h;
-	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-  
-	glutReshapeWindow(w, h);
+	glutReshapeWindow(global_width, global_height);
   
 	glutPostRedisplay();
 }
@@ -789,31 +965,38 @@ void myKeyboard(unsigned char key, int x, int y)
 {
 	switch (key)
 	{
-	case 27:
-	case 'q':
-		exit(0);
-		break;
-		if (deduceFlag)
-		{
-  // move forward
-	case 'w':
-    if(estimatedVertex[0].z < -1)
-        estimatedVertex[0].z += 0.01;
-		// 視点と透視変換行列の取得
-		getPerspectiveTransferMatrix();
-		// 透視変換後の推定された頂点のスクリーン座標の取得
-		getTransferedEstimatedVerticesScreenCoordinates();
-		glutPostRedisplay();
-		break;
-  // move background
-	case 's':
-    estimatedVertex[0].z -= 0.01;
-		// 視点と透視変換行列の取得
-		getPerspectiveTransferMatrix();
-		// 透視変換後の推定された頂点のスクリーン座標の取得
-		getTransferedEstimatedVerticesScreenCoordinates();
-		glutPostRedisplay();
-		break;
+		//case 27:
+		case 'q':
+			exit(0);
+			break;
+		if (deduceFlag){
+			// move forward
+			case 'w':
+				if(estimatedVertex[0].z < -1)
+					estimatedVertex[0].z += 0.01;
+				// 視点と透視変換行列の取得
+				getPerspectiveTransferMatrix();
+				// 透視変換後の推定された頂点のスクリーン座標の取得
+				getTransferedEstimatedVerticesScreenCoordinates();
+				//glutPostRedisplay();
+				break;
+			// move background
+			case 's':
+				estimatedVertex[0].z -= 0.01;
+				// 視点と透視変換行列の取得
+				getPerspectiveTransferMatrix();
+				// 透視変換後の推定された頂点のスクリーン座標の取得
+				getTransferedEstimatedVerticesScreenCoordinates();
+				//glutPostRedisplay();
+				break;
+			case 't':
+				test_flag= true;
+				//for (int i = 0; i < 50000; i++)
+				//	global_data[i] = 0;
+				//glutPostRedisplay();
+				//glTexSubImage2D(GL_TEXTURE_2D, 0, 0,0, 100, 100, GL_RGB, GL_UNSIGNED_BYTE, global_data);
+				//glTexImage2D(GL_TEXTURE_2D, 0,GL_RGB, global_width, global_height, 0, GL_BGR, GL_UNSIGNED_BYTE, global_data);
+				break;
 		}
 	}
 
@@ -823,22 +1006,27 @@ void myKeyboard(unsigned char key, int x, int y)
 void myMouse(int button, int state, int x, int y)
 {
 	int i;
-	struct vector2D pointedCoordinate;
-	int w, h;
-	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-	float threshold = 5.0 / (float)w*5.0 / (float)h; // 近傍と判断する閾値
+	vector2D pointedCoordinate;
+
+	float threshold = 5.0 / (float)global_width*5.0 / (float)global_height; // 近傍と判断する閾値
 	float diffx, diffy, dist; // クリックした点の制御点との距離（の自乗）
   
-  float midx = w/2.0;
-  float midy = h/2.0;
+	float midx = global_width/2.0;
+	float midy = global_height/2.0;
 
 	switch (button)
 	{
 	case GLUT_LEFT_BUTTON:
 		if (state == GLUT_DOWN)
 		{
-
+			on_press = true;
+			last_x = x;
+			last_y = y;
+			start_x = x;
+			start_y = y;
+			
+			current_selection.clear();
+			current_contour.clear();
 			pointedCoordinate.sx = x/midx-1.0;
 			pointedCoordinate.sy = -(y/midy-1.0);
 			if (deduceFlag)
@@ -863,10 +1051,40 @@ void myMouse(int button, int state, int x, int y)
 		}
 		else if (state == GLUT_UP)
 		{
+			if(modenumber == 1){
+				int cur_y = last_y;
+				float grad = (start_x - last_x)*1.0 / (start_y - last_y);
+				int dir = (start_y > last_y) ? 1 : -1;
+				int cur_x = last_x;
+				int count = 1;
+				//cout << "aaaa" << endl;
+				while(cur_y != start_y){
+					//cout << "cccc" << endl;
+					if(current_contour.count(cur_y) == 0)
+						current_contour[cur_y] = vector<int>();
+					current_contour[cur_y].push_back(cur_x);
+					cur_y += dir;
+					cur_x = round(last_x + grad*count*dir);
+					count++;
+				}
+			}
+			on_press = false;
 			selectedCtrlPointIndex = -1;
+			
+		}
+		//glutPostRedisplay();
+		break;
+	case GLUT_RIGHT_BUTTON:
+		//cout << "press" << endl;
+		if(modenumber == 1){
+
+			current_selection.clear();
+			current_contour.clear();
+
 		}
 		break;
 	}
+	glutPostRedisplay();
 }
 
 void initEstimatedVertices(){
@@ -890,18 +1108,17 @@ void initEstimatedVertices(){
 
 void myMotion(int x, int y)
 {
-	int w, h;
-	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-	struct vector2D pointedCoordinate;
-  
-  float midx = w/2.0;
-  float midy = h/2.0;
+
+	vector2D pointedCoordinate;
+    
+	float midx = global_width/2.0;
+	float midy = global_height/2.0;
 	pointedCoordinate.sx = (x/midx-1.0);
 	pointedCoordinate.sy = -(y/midy-1.0);
   
 	if (deduceFlag)
 	{
+		if(!on_press) return;
 		theta += (pbeginsx - pointedCoordinate.sx)*10.0f*PI / 180.0f;
 		phi += (pbeginsy - pointedCoordinate.sy)*10.0f*PI / 180.0f;
 		pbeginsx = pointedCoordinate.sx;
@@ -912,50 +1129,86 @@ void myMotion(int x, int y)
 		getTransferedEstimatedVerticesScreenCoordinates();
 		glutPostRedisplay();
 	}
-	else
+	else if(modenumber == 0)
 	{
 		ctrlPoint[selectedCtrlPointIndex].sx = pointedCoordinate.sx;
 		ctrlPoint[selectedCtrlPointIndex].sy = pointedCoordinate.sy;
 		switch (selectedCtrlPointIndex)
 		{
 		case 0: // 消失点
-			if (ctrlPoint[0].sx <= ctrlPoint[1].sx) ctrlPoint[0].sx = ctrlPoint[1].sx + 1.0f / (float)w;
-			else if (ctrlPoint[0].sx >= ctrlPoint[3].sx) ctrlPoint[0].sx = ctrlPoint[3].sx - 1.0f / (float)w;
-			if (ctrlPoint[0].sy <= ctrlPoint[1].sy) ctrlPoint[0].sy = ctrlPoint[1].sy + 1.0f / (float)h;
-			else if (ctrlPoint[0].sy >= ctrlPoint[3].sy) ctrlPoint[0].sy = ctrlPoint[3].sy - 1.0f / (float)h;
+			if (ctrlPoint[0].sx <= ctrlPoint[1].sx) ctrlPoint[0].sx = ctrlPoint[1].sx + 1.0f / (float)global_width;
+			else if (ctrlPoint[0].sx >= ctrlPoint[3].sx) ctrlPoint[0].sx = ctrlPoint[3].sx - 1.0f / (float)global_width;
+			if (ctrlPoint[0].sy <= ctrlPoint[1].sy) ctrlPoint[0].sy = ctrlPoint[1].sy + 1.0f / (float)global_height;
+			else if (ctrlPoint[0].sy >= ctrlPoint[3].sy) ctrlPoint[0].sy = ctrlPoint[3].sy - 1.0f / (float)global_height;
 			break;
 		case 1: // 左下
-			if (ctrlPoint[1].sx <= -1.0f) ctrlPoint[1].sx = -1.0f + 1.0f / (float)w;
-			else if (ctrlPoint[1].sx >= ctrlPoint[0].sx) ctrlPoint[1].sx = ctrlPoint[0].sx - 1.0f / (float)w;
-			if (ctrlPoint[1].sy >= ctrlPoint[0].sy) ctrlPoint[1].sy = ctrlPoint[0].sy - 1.0f / (float)h;
-			else if (ctrlPoint[1].sy <= -1.0f) ctrlPoint[1].sy = -1.0f + 1.0f / (float)h;
+			if (ctrlPoint[1].sx <= -1.0f) ctrlPoint[1].sx = -1.0f + 1.0f / (float)global_width;
+			else if (ctrlPoint[1].sx >= ctrlPoint[0].sx) ctrlPoint[1].sx = ctrlPoint[0].sx - 1.0f / (float)global_width;
+			if (ctrlPoint[1].sy >= ctrlPoint[0].sy) ctrlPoint[1].sy = ctrlPoint[0].sy - 1.0f / (float)global_height;
+			else if (ctrlPoint[1].sy <= -1.0f) ctrlPoint[1].sy = -1.0f + 1.0f / (float)global_height;
 			ctrlPoint[4].sx = ctrlPoint[1].sx; ctrlPoint[2].sy = ctrlPoint[1].sy;
 			break;
 		case 2: // 右下
-			if (ctrlPoint[2].sx <= ctrlPoint[0].sx) ctrlPoint[2].sx = ctrlPoint[0].sx + 1.0f / (float)w;
-			else if (ctrlPoint[2].sx >= 1.0f) ctrlPoint[2].sx = 1.0f - 1.0f / (float)w;
-			if (ctrlPoint[2].sy >= ctrlPoint[0].sy) ctrlPoint[2].sy = ctrlPoint[0].sy - 1.0f / (float)h;
-			else if (ctrlPoint[2].sy <= -1.0f) ctrlPoint[2].sy = -1.0f + 1.0f / (float)h;
+			if (ctrlPoint[2].sx <= ctrlPoint[0].sx) ctrlPoint[2].sx = ctrlPoint[0].sx + 1.0f / (float)global_width;
+			else if (ctrlPoint[2].sx >= 1.0f) ctrlPoint[2].sx = 1.0f - 1.0f / (float)global_width;
+			if (ctrlPoint[2].sy >= ctrlPoint[0].sy) ctrlPoint[2].sy = ctrlPoint[0].sy - 1.0f / (float)global_height;
+			else if (ctrlPoint[2].sy <= -1.0f) ctrlPoint[2].sy = -1.0f + 1.0f / (float)global_height;
 			ctrlPoint[3].sx = ctrlPoint[2].sx; ctrlPoint[1].sy = ctrlPoint[2].sy;
 			break;
 		case 3: // 右上
-			if (ctrlPoint[3].sx <= ctrlPoint[0].sx) ctrlPoint[3].sx = ctrlPoint[0].sx + 1.0f / (float)w;
-			else if (ctrlPoint[3].sx >= 1.0f) ctrlPoint[3].sx = 1.0f - 1.0f / (float)w;
-			if (ctrlPoint[3].sy >= 1.0f) ctrlPoint[3].sy = 1.0f - 1.0f / (float)h;
-			else if (ctrlPoint[3].sy <= ctrlPoint[0].sy) ctrlPoint[3].sy = ctrlPoint[0].sy + 1.0f / (float)h;
+			if (ctrlPoint[3].sx <= ctrlPoint[0].sx) ctrlPoint[3].sx = ctrlPoint[0].sx + 1.0f / (float)global_width;
+			else if (ctrlPoint[3].sx >= 1.0f) ctrlPoint[3].sx = 1.0f - 1.0f / (float)global_width;
+			if (ctrlPoint[3].sy >= 1.0f) ctrlPoint[3].sy = 1.0f - 1.0f / (float)global_height;
+			else if (ctrlPoint[3].sy <= ctrlPoint[0].sy) ctrlPoint[3].sy = ctrlPoint[0].sy + 1.0f / (float)global_height;
 			ctrlPoint[2].sx = ctrlPoint[3].sx; ctrlPoint[4].sy = ctrlPoint[3].sy;
 			break;
 		case 4: // 左上
-			if (ctrlPoint[4].sx <= -1.0f) ctrlPoint[1].sx = -1.0f + 1.0f / (float)w;
-			else if (ctrlPoint[4].sx >= ctrlPoint[0].sx) ctrlPoint[4].sx = ctrlPoint[0].sx - 1.0f / (float)w;
-			if (ctrlPoint[4].sy >= 1.0f) ctrlPoint[4].sy = 1.0f - 1.0f / (float)h;
-			else if (ctrlPoint[4].sy <= ctrlPoint[0].sy) ctrlPoint[4].sy = ctrlPoint[0].sy + 1.0f / (float)h;
+			if (ctrlPoint[4].sx <= -1.0f) ctrlPoint[1].sx = -1.0f + 1.0f / (float)global_width;
+			else if (ctrlPoint[4].sx >= ctrlPoint[0].sx) ctrlPoint[4].sx = ctrlPoint[0].sx - 1.0f / (float)global_width;
+			if (ctrlPoint[4].sy >= 1.0f) ctrlPoint[4].sy = 1.0f - 1.0f / (float)global_height;
+			else if (ctrlPoint[4].sy <= ctrlPoint[0].sy) ctrlPoint[4].sy = ctrlPoint[0].sy + 1.0f / (float)global_height;
 			ctrlPoint[1].sx = ctrlPoint[4].sx; ctrlPoint[3].sy = ctrlPoint[4].sy;
 			break;
 		};
 		// 推定された頂点のスクリーン座標の取得
 		getEstimatedVerticesScreenCoordinates();
 		glutPostRedisplay();
+	}
+	//foreground mode
+	else {
+		if(!on_press) return ;
+		if(current_selection.size() == 0 || last_x != x || last_y != y){
+			
+			
+			vector5D tmp;
+			tmp.sx = pointedCoordinate.sx;
+			tmp.sy = pointedCoordinate.sy;
+			current_selection.push_back(tmp);
+
+			if(last_y != y){
+				int cur_y = last_y;
+				float grad = (x - last_x)*1.0 / (y - last_y);
+				int dir = (y > last_y) ? 1 : -1;
+				int cur_x = last_x;
+				int count = 1;
+				
+				while(cur_y != y){
+					
+					if(current_contour.count(cur_y) == 0)
+						current_contour[cur_y] = vector<int>();
+					current_contour[cur_y].push_back(cur_x);
+					cur_y += dir;
+					cur_x = round(last_x + grad*count*dir);
+					count++;
+				}
+;
+			}
+
+			last_x = x;
+			last_y = y;
+		}
+		glutPostRedisplay();
+		
 	}
 }
 
@@ -964,12 +1217,18 @@ void myMotion(int x, int y)
 #define DEDUCE_ID		300
 #define INITIALIZE_ID	400
 #define RESOLUTION_ID	500
+#define MODE_ID	        600
+#define ADD_ID	        700
 
 // myGLUIで使われる変数
 //GLUI_Listbox *sourceImageListbox;
 GLUI_Button *deduceButton;
 GLUI_Listbox *resolutionListbox;
 GLUI_Button *initializeButton;
+
+GLUI_Button *confirmButton;
+GLUI_Listbox *modeListbox;
+
 
 // コールバック関数
 void control_cb(int control)
@@ -978,12 +1237,12 @@ void control_cb(int control)
 	switch (control)
 	{
 	case SOURCEIMAGE_ID:
-    char bmpfilepath[270]; // bmpファイルへのパス（bmpファイル名は長さ260の文字配列型）
-    // bmpファイルへのパスの取得
-    sprintf(bmpfilepath, "images/%s", bmpfilename[currentfilenumber]);
-    // 元画像のデータの取得
-    //sourceimage = getBmpdata(bmpfilepath);
-    loadTexture(bmpfilepath);
+		char bmpfilepath[270]; // bmpファイルへのパス（bmpファイル名は長さ260の文字配列型）
+		// bmpファイルへのパスの取得
+		sprintf(bmpfilepath, "images/%s", bmpfilename[currentfilenumber]);
+		// 元画像のデータの取得
+		//sourceimage = getBmpdata(bmpfilepath);
+		loadTexture(bmpfilepath);
 		// 推定された頂点の初期化
 		initEstimatedVertices();
 		// ウィンドウサイズの変更
@@ -1009,7 +1268,6 @@ void control_cb(int control)
     
 		// main_windowに反映
 		if (glutGetWindow() != main_window)glutSetWindow(main_window);
-    
 		glutPostRedisplay();
     
 		// 画像選択と3次元背景の推定のためのGLUIの無効化
@@ -1019,12 +1277,125 @@ void control_cb(int control)
 		resolutionListbox->enable();
     
 		break;
+        
+    case MODE_ID:
+		//in bg
+		if(modenumber == 0){
+			
+			confirmButton->disable();
+			
+		}
+		
+		else if(modenumber == 1){
+			current_contour.clear();
+			current_selection.clear();
+			foreground_objects.clear();
+			
+			confirmButton->enable();
+			
+		}
+		
+    
+		// main_windowに反映
+		if (glutGetWindow() != main_window)glutSetWindow(main_window);
+    
+		glutPostRedisplay();
+    
+		// 画像選択と3次元背景の推定のためのGLUIの無効化
+		//sourceImageListbox->disable();
+		deduceButton->enable();
+    
+		break;    
+    case ADD_ID:
+        
+        if(current_selection.size() != 0){
+			
+			
+			vector<vector<vector5D>> obj;
+			vector<vector<vector2D>> transfered_obj;
+			map<int,vector<int>, greater<int>>::iterator iter = current_contour.begin();
+
+			float midx = global_width/2.0;
+			float midy = global_height/2.0;
+
+			while(iter != current_contour.end()){
+						
+				if(current_contour[iter->first].size() > 1){
+					if((current_contour[iter->first].size() & 1) != 0){
+						cout << "ERROR" << endl;
+						//break;
+						iter++;
+						continue;
+					}
+					
+					for(int i = 0; i < (int)current_contour[iter->first].size(); i += 2){
+						
+						for (int j = current_contour[iter->first][i]; j <= current_contour[iter->first][i+1]; j++)
+							ii.targetMask.at<uchar>(global_height-iter->first, j) = 255;
+						
+					}
+					
+					vector<vector5D> row;
+					vector<vector2D> transfered_row;
+					for(int i = 0; i < (int)current_contour[iter->first].size(); i ++){
+						vector5D tmp;
+						tmp.sx = current_contour[iter->first][i]/midx - 1.0;
+						tmp.sy = 1.0 - (iter->first)/ midy;
+
+						row.push_back(tmp);
+						vector2D tmp1;
+						transfered_row.push_back(tmp1);
+					}
+					obj.push_back(row);
+					transfered_obj.push_back(transfered_row);
+				}
+							
+				iter++;
+			}
+			
+
+			Inpaint::CriminisiInpainter inpainter;
+			inpainter.setSourceImage(ii.background);
+            inpainter.setTargetMask(ii.targetMask);
+            inpainter.setSourceMask(ii.sourceMask);
+            //inpainter.setPatchSize(5);
+            inpainter.initialize();
+			cv::Mat image = ii.background.clone();
+			while(inpainter.hasMoreSteps()) {
+				inpainter.step();
+                inpainter.image().copyTo(image);
+                image.setTo(cv::Scalar(0,250,0), inpainter.targetRegion());
+			} 
+			
+			ii.background = inpainter.image().clone();
+			//ii.displayImage = ii.originalImage.clone();
+            ii.targetMask = inpainter.targetRegion().clone();
+		
+			glTexImage2D(GL_TEXTURE_2D, 0,GL_RGB, global_width, global_height, 0, GL_BGR, GL_UNSIGNED_BYTE, ii.background.data);
+			
+			foreground_objects.push_back(obj);
+			transfered_foreground_objects.push_back(transfered_obj);
+			current_selection.clear();
+			current_contour.clear();
+			
+		}
+        
+    
+		// main_windowに反映
+		if (glutGetWindow() != main_window)glutSetWindow(main_window);
+    
+		glutPostRedisplay();
+    
+		// 画像選択と3次元背景の推定のためのGLUIの無効化
+		break;    
+        
+        
 	case INITIALIZE_ID:
 		// 角度の初期化
 		theta = 0.0f; phi = 0.0f;
 		// 旗を折る
 		deduceFlag = 0;
-    glEnable(GL_TEXTURE_2D);
+		glEnable(GL_TEXTURE_2D);
 		// main_windowに反映
 		if (glutGetWindow() != main_window) glutSetWindow(main_window);
 		glutPostRedisplay();
@@ -1033,6 +1404,14 @@ void control_cb(int control)
 		deduceButton->enable();
 		// 解像度選択のためのGLUIの無効化
 		resolutionListbox->disable();
+		
+		foreground_objects.clear();
+		transfered_foreground_objects.clear();
+		current_selection.clear();
+		current_contour.clear();
+		
+		ii.background = ii.originalImage.clone();
+		
 		// 解像度選択のためのGLUIの初期化
 		resolutionnumber = 0; glui->sync_live(); rough_coefficient = 0.05f; // Preview
 		break;
@@ -1044,7 +1423,7 @@ void control_cb(int control)
 		else if (resolutionnumber == 1) rough_coefficient = 0.01f; // Low
 		else if (resolutionnumber == 2) rough_coefficient = 0.005f; // Normal
 		else if (resolutionnumber == 3) rough_coefficient = 0.001f; // High
-		if (glutGetWindow() != main_window)glutSetWindow(main_window);
+		//if (glutGetWindow() != main_window)glutSetWindow(main_window);
 		// main_windowに計算中を表示
 		if (glutGetWindow() != main_window) glutSetWindow(main_window);
 		// バッファクリア
@@ -1072,9 +1451,19 @@ void myGlui()
 	// glui windowの作成
 	glui = GLUI_Master.create_glui("Controller", 0, 100, 100);
 
+    glui->add_column(false);
+   
+	modeListbox = glui->add_listbox("Mode", &modenumber, MODE_ID, control_cb);
+	modeListbox->add_item(0, "Background Grid");
+	modeListbox->add_item(1, "Foreground Object");
+	
+    //glui->add_column(false);
+    confirmButton = glui->add_button("Add to Foreground", ADD_ID, control_cb);
+    confirmButton->disable();
+    
 	glui->add_column(false);
 	deduceButton = glui->add_button("Deduce", DEDUCE_ID, control_cb);
-	glui->add_column(false);
+	//glui->add_column(false);
 	// resolutionListboxの作成
 	resolutionListbox = glui->add_listbox("Resolution", &resolutionnumber, RESOLUTION_ID, control_cb);
 	resolutionListbox->add_item(0, "Preview");
@@ -1083,7 +1472,7 @@ void myGlui()
 	resolutionListbox->add_item(3, "High");
 	resolutionListbox->disable();
 	glui->add_column(false);
-	initializeButton = glui->add_button("Initialize", INITIALIZE_ID, control_cb);
+	initializeButton = glui->add_button("Reset", INITIALIZE_ID, control_cb);
 }
 
 void myInit(){
@@ -1095,7 +1484,7 @@ void myInit(){
   glGenTextures(1, &texture);
   glBindTexture(GL_TEXTURE_2D, texture);
 
-  glTexImage2D(GL_TEXTURE_2D, 0,GL_RGB, global_width, global_height, 0, GL_BGR, GL_UNSIGNED_BYTE, global_data);
+  glTexImage2D(GL_TEXTURE_2D, 0,GL_RGB, global_width, global_height, 0, GL_BGR, GL_UNSIGNED_BYTE, ii.originalImage.data);
   glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   
@@ -1107,6 +1496,7 @@ void myInit(){
   glLoadIdentity();
   // OpenGLでは2次元平行投影として透視投影はソフトで計算
   gluOrtho2D(-1.0f, 1.0f, -1.0f, 1.0f);
+  
 }
 
 int main(int argc, char **argv)
